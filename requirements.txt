@@ -1,29 +1,16 @@
-# Web Framework
-fastapi==0.111.0
-uvicorn[standard]==0.29.0
+# Web Application Framework
+fastapi
+uvicorn[standard]
 
-# Pydantic and Environment
-pydantic==2.7.1
-python-dotenv==1.0.1
+# Web Scraping
+selenium
+beautifulsoup4
 
-# Database
-motor==3.4.0
-pymongo>=4.6,<5.0
+# LangChain & RAG Core
+langchain
+langchain-community
 
-# APIs and Local Scraping/Crawling
-firecrawl-py==0.0.17
-beautifulsoup4==4.12.3
-requests==2.31.0
-
-# LangChain and ML
-langchain==0.2.1
-langchain-google-genai==1.0.4
-# --- THIS LINE IS UPDATED ---
-faiss-cpu==1.12.0
-# -----------------------------
-sentence-transformers==2.7.0
-langchain-community==0.2.1
-langchain-core==0.2.1
-
-# For saving/loading documents
-pickle5==0.0.11
+# Vector Store & Embeddings
+faiss-cpu
+ollama
+numpy
