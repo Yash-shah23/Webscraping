@@ -1,6 +1,7 @@
 # Web Application Framework
 fastapi
 uvicorn[standard]
+python-dotenv
 
 # Web Scraping
 selenium
@@ -8,9 +9,11 @@ beautifulsoup4
 
 # LangChain & RAG Core
 langchain
-langchain-community
-
-# Vector Store & Embeddings
+lang-community
 faiss-cpu
 ollama
-numpy
+
+# Database
+supabase
+postgrest-py
+pydantic<2
