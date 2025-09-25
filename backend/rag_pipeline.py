@@ -1,81 +1,131 @@
-import time
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.chrome.options import Options
+import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from langchain_community.llms import Ollama
-from langchain_community.embeddings import OllamaEmbeddings
-from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_community.vectorstores import SupabaseVectorStore
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_core.prompts import ChatPromptTemplate
 from langchain.docstore.document import Document
+from supabase.client import Client
 
 class RAGPipeline:
-    def __init__(self, chromedriver_path: str):
-        self.chromedriver_path = chromedriver_path
-        self.embedding_model = OllamaEmbeddings(model="nomic-embed-text")
-        self.llm = Ollama(model="gemma3:latest")
-        self.vector_store = None
-        self.rag_chain = None
-        self.is_ready = False
-        print("RAG Pipeline instance initialized.")
+    def __init__(self):
+        model_name = "all-MiniLM-L6-v2"
+        model_kwargs = {'device': 'cpu'}
+        encode_kwargs = {'normalize_embeddings': False}
+        self.embedding_model = HuggingFaceEmbeddings(
+            model_name=model_name,
+            model_kwargs=model_kwargs,
+            encode_kwargs=encode_kwargs
+        )
 
-    def _setup_driver(self):
-        chrome_options = Options(); chrome_options.add_argument("--headless"); chrome_options.add_argument("--log-level=3")
-        service = Service(executable_path=self.chromedriver_path)
-        return webdriver.Chrome(service=service, options=chrome_options)
+        # CRITICAL: Switched to a smaller, faster model to meet the 10-sec target.
+        self.llm = Ollama(model="gemma2:2b")
+        print("RAG Pipeline instance initialized with fast CPU embeddings and 'gemma2:2b' model.")
 
-    def scrape_url(self, start_url: str):
-        """Scrapes a site and returns the raw content."""
-        driver = self._setup_driver()
-        domain_name = urlparse(start_url).netloc
-        urls_to_scrape = [start_url]; visited_urls = set(); all_page_data = []
-        while urls_to_scrape:
-            current_url = urls_to_scrape.pop(0)
-            if current_url in visited_urls: continue
-            print(f"  -> Scraping page: {current_url}")
-            visited_urls.add(current_url)
-            try:
-                driver.get(current_url); time.sleep(2)
-                soup = BeautifulSoup(driver.page_source, 'html.parser')
-            except Exception as e:
-                print(f"   ! Could not fetch {current_url}: {e}"); continue
+
+    def _fetch_and_parse(self, url: str, domain_name: str):
+        """Fetches a single URL, parses it, and returns content and new links."""
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+            response = requests.get(url, timeout=5, headers=headers)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
             page_title = soup.title.string.strip() if soup.title else "Untitled"
+            
             if soup.body:
                 page_content = "\n".join(line.strip() for line in soup.body.get_text(separator='\n', strip=True).splitlines() if len(line.split()) > 3)
-            else: page_content = ""
-            if page_content:
-                all_page_data.append({"source_url": current_url, "title": page_title, "content": page_content})
+            else:
+                return None, []
+
+            links = set()
             for link_tag in soup.find_all('a', href=True):
-                absolute_url = urljoin(current_url, link_tag['href']).split('#')[0]
-                if (urlparse(absolute_url).netloc == domain_name and absolute_url not in visited_urls and absolute_url not in urls_to_scrape):
-                    urls_to_scrape.append(absolute_url)
-        driver.quit()
+                absolute_url = urljoin(url, link_tag['href']).split('#')[0]
+                if urlparse(absolute_url).netloc == domain_name:
+                    links.add(absolute_url)
+            
+            return {"source_url": url, "title": page_title, "content": page_content}, list(links)
+        except requests.RequestException:
+            return None, []
+
+    def scrape_concurrently(self, start_url: str, max_pages: int = 20):
+        """
+        Scrapes a site concurrently using a thread pool for maximum speed.
+        It scrapes the landing page, then all unique links found on it.
+        """
+        print(f"Starting concurrent scrape for {start_url}...")
+        domain_name = urlparse(start_url).netloc
+        
+        # First, scrape the entry point to get the initial set of links
+        initial_data, initial_links = self._fetch_and_parse(start_url, domain_name)
+        if not initial_data:
+            return []
+
+        all_page_data = [initial_data]
+        urls_to_scrape = [link for link in initial_links if link != start_url]
+        visited_urls = {start_url}
+
+        # Use a thread pool to fetch all other pages concurrently
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            future_to_url = {executor.submit(self._fetch_and_parse, url, domain_name): url for url in urls_to_scrape[:max_pages-1]}
+            
+            for future in as_completed(future_to_url):
+                url = future_to_url[future]
+                if url in visited_urls:
+                    continue
+                
+                page_data, _ = future.result()
+                if page_data:
+                    all_page_data.append(page_data)
+                visited_urls.add(url)
+                print(f"  -> Finished scraping page: {url}")
+        
+        print(f"Concurrent scrape finished. Total pages scraped: {len(all_page_data)}")
         return all_page_data
 
-    def build_index_from_data(self, page_data: list):
-        """Builds the in-memory FAISS index from scraped content."""
+    def create_and_store_embeddings(self, session_id: str, page_data: list, supabase_client: Client):
         if not page_data: return
-        documents = [Document(page_content=p.get("content", ""), metadata={"source": p.get("source_url", ""), "title": p.get("title", "")}) for p in page_data]
+        for p in page_data: p['session_id'] = session_id
+            
+        documents = [
+            Document(page_content=p.get("content", ""), metadata={"source": p.get("source_url", ""), "title": p.get("title", ""), "session_id": p.get("session_id")})
+            for p in page_data
+        ]
         split_docs = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200).split_documents(documents)
         
-        print(f"Creating in-memory vector store with {len(split_docs)} chunks...")
-        self.vector_store = FAISS.from_documents(split_docs, self.embedding_model)
-        
-        system_prompt = ("You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question. "
-                         "If you don't know the answer, just say that you don't know. Use three sentences maximum and keep the answer concise.\n\n"
-                         "{context}")
-        prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", "{input}")])
-        question_answer_chain = create_stuff_documents_chain(self.llm, prompt)
-        retriever = self.vector_store.as_retriever()
-        self.rag_chain = create_retrieval_chain(retriever, question_answer_chain)
-        self.is_ready = True
-        print("Pipeline is ready with in-memory index.")
+        print(f"Storing {len(split_docs)} document chunks in Supabase...")
+        SupabaseVectorStore.from_documents(
+            documents=split_docs, embedding=self.embedding_model, client=supabase_client,
+            table_name="documents", query_name="match_documents"
+        )
+        print("Embeddings stored successfully.")
 
-    def query(self, question: str):
-        if not self.is_ready: return "Pipeline not ready."
-        response = self.rag_chain.invoke({"input": question})
+    def answer_question(self, session_id: str, question: str, supabase_client: Client):
+        vector_store = SupabaseVectorStore(
+            client=supabase_client, embedding=self.embedding_model,
+            table_name="documents", query_name="match_documents"
+        )
+
+        # OPTIMIZATION: Retrieve fewer documents (k=3) to create a smaller prompt for the LLM.
+        retriever = vector_store.as_retriever(
+            search_kwargs={'k': 3, 'filter': {'session_id': session_id}}
+        )
+
+        system_prompt = (
+            "You are an assistant for question-answering tasks. Use the following pieces of retrieved context to answer the question. "
+            "If you don't know the answer, just say that you don't know. Use three sentences maximum and keep the answer concise.\n\n"
+            "{context}"
+        )
+        prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("human", "{input}")])
+        
+        question_answer_chain = create_stuff_documents_chain(self.llm, prompt)
+        rag_chain = create_retrieval_chain(retriever, question_answer_chain)
+        
+        response = rag_chain.invoke({"input": question})
         return response.get("answer", "No answer could be generated.")

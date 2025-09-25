@@ -17,3 +17,4 @@ ollama
 supabase
 postgrest-py
 pydantic<2
+selenium
